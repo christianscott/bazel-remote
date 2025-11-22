@@ -1,6 +1,7 @@
 package s3proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,10 @@ import (
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
 	"github.com/buchgr/bazel-remote/v2/utils/backendproxy"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/prometheus/client_golang/prometheus"
@@ -19,15 +24,18 @@ import (
 )
 
 type s3Cache struct {
-	mcore            *minio.Core
-	prefix           string
-	bucket           string
-	uploadQueue      chan<- backendproxy.UploadReq
-	accessLogger     cache.Logger
-	errorLogger      cache.Logger
-	v2mode           bool
-	updateTimestamps bool
-	objectKey        func(hash string, kind cache.EntryKind) string
+	mcore                      *minio.Core
+	dynamo                     *dynamodb.DynamoDB
+	dynamoTable                string
+	dynamoInlineThresholdBytes int64
+	prefix                     string
+	bucket                     string
+	uploadQueue                chan<- backendproxy.UploadReq
+	accessLogger               cache.Logger
+	errorLogger                cache.Logger
+	v2mode                     bool
+	updateTimestamps           bool
+	objectKey                  func(hash string, kind cache.EntryKind) string
 }
 
 var (
@@ -56,6 +64,7 @@ func New(
 	UpdateTimestamps bool,
 	Region string,
 	MaxIdleConns int,
+	DynamoTable string,
 
 	storageMode string, accessLogger cache.Logger,
 	errorLogger cache.Logger, numUploaders, maxQueuedUploads int) cache.Proxy {
@@ -96,15 +105,23 @@ func New(
 		log.Fatalf("Unsupported storage mode for the s3proxy backend: %q, must be one of \"zstd\" or \"uncompressed\"",
 			storageMode)
 	}
+	sess := session.Must(session.NewSessionWithOptions(session.Options{
+		SharedConfigState: session.SharedConfigEnable,
+	}))
+	svc := dynamodb.New(sess)
 
 	c := &s3Cache{
-		mcore:            minioCore,
-		prefix:           Prefix,
-		bucket:           Bucket,
-		accessLogger:     accessLogger,
-		errorLogger:      errorLogger,
-		v2mode:           storageMode == "zstd",
-		updateTimestamps: UpdateTimestamps,
+		mcore:       minioCore,
+		dynamo:      svc,
+		dynamoTable: DynamoTable,
+		// dynamo objects cannot be larger than 400KB. conservatively limit to 300KB.
+		dynamoInlineThresholdBytes: 300 * 1024,
+		prefix:                     Prefix,
+		bucket:                     Bucket,
+		accessLogger:               accessLogger,
+		errorLogger:                errorLogger,
+		v2mode:                     storageMode == "zstd",
+		updateTimestamps:           UpdateTimestamps,
 	}
 
 	if c.v2mode {
@@ -156,23 +173,92 @@ func logResponse(log cache.Logger, method, bucket, key string, err error) {
 	log.Printf("S3 %s %s %s %s", method, bucket, key, status)
 }
 
-func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
-	_, err := c.mcore.PutObject(
-		context.Background(),
-		c.bucket,                          // bucketName
-		c.objectKey(item.Hash, item.Kind), // objectName
-		item.Rc,                           // reader
-		item.SizeOnDisk,                   // objectSize
-		"",                                // md5base64
-		"",                                // sha256
-		minio.PutObjectOptions{
-			UserMetadata: map[string]string{
-				"Content-Type": "application/octet-stream",
-			},
-		}, // metadata
-	)
+// Helper function for logging responses
+func logDynamoResponse(log cache.Logger, method, bucket, key string, err error) {
+	status := "OK"
+	if err != nil {
+		status = err.Error()
+	}
 
-	logResponse(c.accessLogger, "UPLOAD", c.bucket, c.objectKey(item.Hash, item.Kind), err)
+	log.Printf("DYNAMO %s %s %s %s", method, bucket, key, status)
+}
+
+type dynamoItem struct {
+	ObjectKey   string
+	Data        []byte
+	S3Link      string
+	LogicalSize int64
+	SizeOnDisk  int64
+	Kind        cache.EntryKind
+	Hash        string
+}
+
+func (c *s3Cache) UploadFile(item backendproxy.UploadReq) {
+	var body []byte
+	s3Link := ""
+	if item.LogicalSize < c.dynamoInlineThresholdBytes {
+		body = make([]byte, item.LogicalSize)
+		_, err := io.ReadFull(item.Rc, body)
+		if err != nil {
+			c.errorLogger.Printf("failed to read inline data: %v", err)
+			_ = item.Rc.Close()
+			return
+		}
+	} else {
+		// empty body, data will be stored in s3
+		body = nil
+		s3Link = c.objectKey(item.Hash, item.Kind)
+	}
+	dbItem := dynamoItem{
+		ObjectKey:   c.objectKey(item.Hash, item.Kind),
+		Data:        body,
+		S3Link:      s3Link,
+		LogicalSize: item.LogicalSize,
+		SizeOnDisk:  item.SizeOnDisk,
+		Kind:        item.Kind,
+		Hash:        item.Hash,
+	}
+
+	av, err := dynamodbattribute.MarshalMap(dbItem)
+	if err != nil {
+		c.errorLogger.Printf("failed to marshal dynamo item: %v", err)
+		_ = item.Rc.Close()
+		return
+	}
+
+	_, err = c.dynamo.PutItem(&dynamodb.PutItemInput{
+		TableName: aws.String(c.dynamoTable),
+		Item:      av,
+	})
+	if err != nil {
+		c.errorLogger.Printf("failed to put dynamo item: %v", err)
+		_ = item.Rc.Close()
+		return
+	}
+	logDynamoResponse(c.accessLogger, "UPLOAD", c.bucket, c.objectKey(item.Hash, item.Kind), err)
+
+	if s3Link != "" {
+		_, err := c.mcore.PutObject(
+			context.Background(),
+			c.bucket,                          // bucketName
+			c.objectKey(item.Hash, item.Kind), // objectName
+			item.Rc,                           // reader
+			item.SizeOnDisk,                   // objectSize
+			"",                                // md5base64
+			"",                                // sha256
+			minio.PutObjectOptions{
+				UserMetadata: map[string]string{
+					"Content-Type": "application/octet-stream",
+				},
+			}, // metadata
+		)
+		logResponse(c.accessLogger, "UPLOAD", c.bucket, c.objectKey(item.Hash, item.Kind), err)
+		if err != nil {
+			c.errorLogger.Printf("failed to put s3 object: %v", err)
+			_ = item.Rc.Close()
+			return
+		}
+	}
 
 	_ = item.Rc.Close()
 }
@@ -215,11 +301,40 @@ func (c *s3Cache) UpdateModificationTimestamp(ctx context.Context, bucket string
 }
 
 func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (io.ReadCloser, int64, error) {
+	key := c.objectKey(hash, kind)
+	dbItem, err := c.dynamo.GetItem(&dynamodb.GetItemInput{
+		TableName: aws.String(c.dynamoTable),
+		Key: map[string]*dynamodb.AttributeValue{
+			"ObjectKey": {S: aws.String(key)},
+		},
+	})
+	fmt.Printf("dbItem=%+v\n", dbItem)
+	if err != nil {
+		cacheMisses.Inc()
+		logDynamoResponse(c.accessLogger, "DOWNLOAD1", c.dynamoTable, key, err)
+		return nil, -1, err
+	}
+	if dbItem.Item == nil {
+		cacheMisses.Inc()
+		logDynamoResponse(c.accessLogger, "DOWNLOAD2", c.dynamoTable, key, errNotFound)
+		return nil, -1, err
+	}
+
+	item := dynamoItem{}
+	err = dynamodbattribute.UnmarshalMap(dbItem.Item, &item)
+	if err != nil {
+		cacheMisses.Inc()
+		logDynamoResponse(c.accessLogger, "DOWNLOAD3", c.bucket, c.objectKey(hash, kind), err)
+		return nil, -1, err
+	}
+	if item.Data != nil {
+		return io.NopCloser(bytes.NewReader(item.Data)), item.LogicalSize, nil
+	}
 
 	rc, info, _, err := c.mcore.GetObject(
 		ctx,
 		c.bucket,                 // bucketName
-		c.objectKey(hash, kind),  // objectName
+		item.S3Link,              // objectName
 		minio.GetObjectOptions{}, // opts
 	)
 	if err != nil {
@@ -251,21 +366,28 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 	size := int64(-1)
 	exists := false
 
-	s, err := c.mcore.StatObject(
-		ctx,
-		c.bucket,                  // bucketName
-		c.objectKey(hash, kind),   // objectName
-		minio.StatObjectOptions{}, // opts
-	)
+	dbItem, err := c.dynamo.GetItem(&dynamodb.GetItemInput{
+		TableName: aws.String(c.dynamoTable),
+		Key: map[string]*dynamodb.AttributeValue{
+			"ObjectKey": {S: aws.String(c.objectKey(hash, kind))},
+		},
+	})
+	fmt.Printf("dbItem=%+v\n", dbItem)
 
-	exists = (err == nil)
+	exists = (err == nil && dbItem.Item != nil)
 	if err != nil {
 		err = errNotFound
 	} else if kind != cache.CAS || !c.v2mode {
-		size = s.Size
+		item := dynamoItem{}
+		err = dynamodbattribute.UnmarshalMap(dbItem.Item, &item)
+		if err != nil {
+			exists = false
+		} else {
+			size = item.LogicalSize
+		}
 	}
 
-	logResponse(c.accessLogger, "CONTAINS", c.bucket, c.objectKey(hash, kind), err)
+	logDynamoResponse(c.accessLogger, "CONTAINS", c.bucket, c.objectKey(hash, kind), err)
 
 	return exists, size
 }

@@ -3,6 +3,7 @@ module github.com/buchgr/bazel-remote/v2
 require (
 	cloud.google.com/go/longrunning v0.6.7
 	github.com/abbot/go-http-auth v0.4.1-0.20220112235402-e1cee1c72f2f
+	github.com/aws/aws-sdk-go v1.44.256
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
 	github.com/djherbis/atime v1.1.0
 	github.com/google/go-cmp v0.7.0
@@ -41,7 +42,6 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.11.2 // indirect
 	github.com/Azure/go-ntlmssp v0.0.0-20221128193559-754e69321358 // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.5.0 // indirect
-	github.com/aws/aws-sdk-go v1.44.256 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -50,6 +50,7 @@ require (
 	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.0 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
+	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/minio/crc64nvme v1.1.1 // indirect
