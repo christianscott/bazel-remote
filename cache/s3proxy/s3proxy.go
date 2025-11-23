@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"path"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
@@ -46,6 +47,11 @@ var (
 	cacheMisses = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "bazel_remote_s3_cache_misses",
 		Help: "The total number of s3 backend cache misses",
+	})
+	histDynamoFetchLatency = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "bazel_remote_s3_dynamo_fetch_latency_ms",
+		Help:    "The latency of fetches from DynamoDB",
+		Buckets: []float64{0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000},
 	})
 )
 
@@ -302,13 +308,15 @@ func (c *s3Cache) UpdateModificationTimestamp(ctx context.Context, bucket string
 
 func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (io.ReadCloser, int64, error) {
 	key := c.objectKey(hash, kind)
+	fetchStartTime := time.Now()
 	dbItem, err := c.dynamo.GetItem(&dynamodb.GetItemInput{
 		TableName: aws.String(c.dynamoTable),
 		Key: map[string]*dynamodb.AttributeValue{
 			"ObjectKey": {S: aws.String(key)},
 		},
 	})
-	fmt.Printf("dbItem=%+v\n", dbItem)
+	histDynamoFetchLatency.Observe(float64(time.Since(fetchStartTime).Milliseconds()))
+
 	if err != nil {
 		cacheMisses.Inc()
 		logDynamoResponse(c.accessLogger, "DOWNLOAD1", c.dynamoTable, key, err)
@@ -366,13 +374,14 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 	size := int64(-1)
 	exists := false
 
+	fetchStartTime := time.Now()
 	dbItem, err := c.dynamo.GetItem(&dynamodb.GetItemInput{
 		TableName: aws.String(c.dynamoTable),
 		Key: map[string]*dynamodb.AttributeValue{
 			"ObjectKey": {S: aws.String(c.objectKey(hash, kind))},
 		},
 	})
-	fmt.Printf("dbItem=%+v\n", dbItem)
+	histDynamoFetchLatency.Observe(float64(time.Since(fetchStartTime).Milliseconds()))
 
 	exists = (err == nil && dbItem.Item != nil)
 	if err != nil {
