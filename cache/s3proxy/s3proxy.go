@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"path"
+	"time"
 
 	"github.com/buchgr/bazel-remote/v2/cache"
 	"github.com/buchgr/bazel-remote/v2/cache/disk/casblob"
@@ -38,6 +39,11 @@ var (
 	cacheMisses = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "bazel_remote_s3_cache_misses",
 		Help: "The total number of s3 backend cache misses",
+	})
+	histS3FetchLatency = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "bazel_remote_s3_fetch_latency_ms",
+		Help:    "The latency of fetches from S3",
+		Buckets: []float64{10, 25, 50, 100, 250, 500, 1000, 2500, 5000},
 	})
 )
 
@@ -215,13 +221,15 @@ func (c *s3Cache) UpdateModificationTimestamp(ctx context.Context, bucket string
 }
 
 func (c *s3Cache) Get(ctx context.Context, kind cache.EntryKind, hash string, _ int64) (io.ReadCloser, int64, error) {
-
+	fetchStartTime := time.Now()
 	rc, info, _, err := c.mcore.GetObject(
 		ctx,
 		c.bucket,                 // bucketName
 		c.objectKey(hash, kind),  // objectName
 		minio.GetObjectOptions{}, // opts
 	)
+	histS3FetchLatency.Observe(float64(time.Since(fetchStartTime).Milliseconds()))
+
 	if err != nil {
 		if minio.ToErrorResponse(err).Code == "NoSuchKey" {
 			cacheMisses.Inc()
@@ -251,12 +259,14 @@ func (c *s3Cache) Contains(ctx context.Context, kind cache.EntryKind, hash strin
 	size := int64(-1)
 	exists := false
 
+	fetchStartTime := time.Now()
 	s, err := c.mcore.StatObject(
 		ctx,
 		c.bucket,                  // bucketName
 		c.objectKey(hash, kind),   // objectName
 		minio.StatObjectOptions{}, // opts
 	)
+	histS3FetchLatency.Observe(float64(time.Since(fetchStartTime).Milliseconds()))
 
 	exists = (err == nil)
 	if err != nil {
